@@ -1131,8 +1131,7 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, auto-notify the agent when the process exits
-        watch_patterns: List of strings to watch for in background output; fires a notification on first match per pattern. Use ONLY for mid-process signals (errors, readiness markers) that appear before exit. For end-of-run markers use notify_on_complete instead — stacking both produces duplicate, delayed notifications.
+        watch_patterns: List of strings to watch for in output; triggers notification on match
 
     Returns:
         str: JSON string with output, exit_code, session_id (if backgrounded), and error fields
@@ -1721,7 +1720,7 @@ TERMINAL_SCHEMA = {
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Strings to watch for in background process output. Fires a notification the first time each pattern matches a line of output. **Use ONLY for mid-process signals** you want to react to before the process exits — errors, readiness markers, intermediate step markers (e.g. [\"ERROR\", \"Traceback\", \"listening on port\"]). Do NOT use for end-of-run markers (summary headers, 'DONE', 'PASS' printed right before exit) — use `notify_on_complete` for that instead. Stacking end-of-run patterns on top of `notify_on_complete` produces duplicate, delayed notifications that arrive after you've already moved on, since delivery is asynchronous and continues after the process exits."
+                "description": "List of strings to watch for in command output. When any pattern matches a line of output, you'll be notified with the matching text. Use for monitoring logs, watching for errors, or waiting for specific events (e.g. [\"ERROR\", \"FAIL\", \"listening on port\"])."
             }
         },
         "required": ["command"]

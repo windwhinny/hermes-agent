@@ -159,7 +159,7 @@ terminal(command="ls -la")
 # Returns: {"output": "file1\nfile2\n...", "exit_code": 0}
 
 # Long commands auto-background
-default(command="pytest -v tests/")
+terminal(command="pytest -v tests/")
 # Returns: {"session_id": "proc_abc123", "pid": 12345, "status": "auto_backgrounded"}
 
 # Then manage with the process tool:
