@@ -289,7 +289,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters())
+                client.add(messages, **self._write_filters(), output_format="v1.1")
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -359,6 +359,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     [{"role": "user", "content": conclusion}],
                     **self._write_filters(),
                     infer=False,
+                    output_format="v1.1",
                 )
                 self._record_success()
                 return json.dumps({"result": "Fact stored."})
