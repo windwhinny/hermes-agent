@@ -53,13 +53,32 @@ upstream 在 terminal_tool.py 上做了多项改进，合入情况：
 3. **Foreground timeout cap**：upstream 增加了 FOREGROUND_MAX_TIMEOUT 拒绝逻辑。**已删除**——自动后台化模式下不需要。
 4. **Terminal child background hang fix**（f336ae3d）：防止命令后台子进程导致 terminal 挂起。已合入。
 
+### 2026-04-20 "先启再放"改造
+原版自动后台化是"先杀再启"模式：先用 `env.execute(command, timeout=5)` 尝试前台执行，5秒超时后杀死进程（exit_code 124），再用 `process_registry.spawn_local()` 启动全新后台进程。这存在严重问题：
+1. 超时后进程被杀死，进度丢失（如 pip install 装到一半被杀）
+2. 重新 spawn 需要重新启动进程，浪费资源
+3. 对远程环境（docker/singularity）更浪费：杀一个再启一个，开了两个远程容器
+
+改为"先启再放"模式：
+1. **Step 1**：一开始就用 `process_registry.spawn_local()` 或 `spawn_via_env()` 启动后台进程
+2. **Step 2**：短时间（AUTO_BACKGROUND_TIMEOUT=5秒）轮询检查进程是否完成
+3. **Step 2a（快返回）**：如果进程在阈值内完成，从 ProcessSession 读取 output_buffer 和 exit_code，清理 session，返回结果——体验与原版 env.execute 一致
+4. **Step 3（慢后台）**：如果进程未完成，保持后台运行，返回 auto_backgrounded 状态——进程不中断，进度不丢失
+
+关键改动：
+- `AUTO_BACKGROUND_TIMEOUT` 从局部变量提升为模块级常量（便于测试 mock）
+- 删除了 `env.execute()` 的调用，所有命令都通过 process_registry spawn
+- 删除了 "先杀再启" 的 env.execute timeout + exit_code 124 检测逻辑
+- 删除了 transient error retry 逻辑（因为不再有 env.execute，spawn 失败直接返回错误）
+- 快返回路径需要从 ProcessSession 的 output_buffer / exit_code 提取结果，并清理 registry 中的 session
+
 ### 涉及文件及冲突解决指引
 
 | 文件 | 改动 | 冲突解决策略 |
 |------|------|-------------|
-| `tools/terminal_tool.py` | 删除 `background`/`notify_on_complete` 参数及相关 schema；删除 FOREGROUND_MAX_TIMEOUT 拒绝逻辑和 `_foreground_background_guidance` 调用；保留 `_rewrite_compound_background` 和 `_foreground_background_guidance` 函数定义（dead code，无害）；保留 5 秒自动后台化核心逻辑 | **已解决**。合并时保留了自动后台化核心逻辑，合入了 upstream 的 `_rewrite_compound_background`。`_foreground_background_guidance` 函数保留但调用已移除。如果后续 upstream 进一步改进 background 相关功能，需评估是否适配为自动后台化模式 |
-| `skills/` 下多个 SKILL.md | 更新了 codex、hermes-agent、opencode 等技能中 terminal 用法示例（去掉 background=True） | 低风险，本地版本直接保留 |
-| `tests/tools/test_terminal_auto_background.py` | 新增 10 个自动后台化测试 | 如果 upstream 也有 terminal 测试改动，需确保两边测试都通过 |
+|| `tools/terminal_tool.py` | 删除 `background`/`notify_on_complete` 参数及相关 schema；删除 FOREGROUND_MAX_TIMEOUT 拒绝逻辑和 `_foreground_background_guidance` 调用；保留 `_rewrite_compound_background` 和 `_foreground_background_guidance` 函数定义（dead code，无害）；**"先启再放"改造**：删除 env.execute 调用，所有命令通过 spawn_local/spawn_via_env 启动，新增 poll 循环和快返回/慢后台两条路径，AUTO_BACKGROUND_TIMEOUT 提升为模块级常量 | **已解决**。合并时必须保留"先启再放"核心逻辑。如果 upstream 改进了 env.execute 或增加了新的 foreground 逻辑，需要评估是否适配为"先启再放"模式。spawn_local/spawn_via_env 的参数如果有变化，需要同步 |
+|| `skills/` 下多个 SKILL.md | 更新了 codex、hermes-agent、opencode 等技能中 terminal 用法示例（去掉 background=True） | 低风险，本地版本直接保留 |
+|| `tests/tools/test_terminal_auto_background.py` | **重写**：从 mock env.execute 改为 mock spawn_local/spawn_via_env + ProcessSession；新增 test_remote_env_uses_spawn_via_env、test_interrupted_command、test_spawn_failure 等 12 个测试 | 如果 upstream 也有 terminal 测试改动，需确保两边测试都通过。测试用 `patch("tools.terminal_tool.AUTO_BACKGROUND_TIMEOUT", 0)` 控制 slow case 的超时行为 |
 | `tests/tools/test_terminal_foreground_timeout_cap.py` | 已删除（与自动后台化模式不兼容） | 不需要恢复 |
 | `tests/tools/test_terminal_tool_pty_fallback.py` | 更新 4 个测试适配新行为 | 低风险 |
 
@@ -185,7 +204,7 @@ upstream 在 feishu.py 上做了重要改进，已合入并覆盖了我们的简
 ## 合并策略总原则
 
 1. **Mem0 插件**：本地版本是完全不同的架构，合并时几乎总是保留本地版本，只在 MemoryProvider ABC 接口变更时适配
-2. **Terminal 自动后台化**：核心逻辑必须保留，upstream 的 background 相关改动需适配为自动后台化模式。upstream 的 `_rewrite_compound_background` 已合入（有用）。`_foreground_background_guidance` 函数保留但调用已移除
+2. **Terminal 自动后台化**："先启再放"核心逻辑必须保留，upstream 的 background 相关改动需适配为"先启再放"模式。upstream 的 `_rewrite_compound_background` 已合入（有用）。`_foreground_background_guidance` 函数保留但调用已移除。AUTO_BACKGROUND_TIMEOUT 是模块级常量便于测试
 3. **会话持久化**：flush 逻辑是功能性修复，必须在合并后保留。upstream 已合入更完善的 proactive memory flushing
 4. **Prompt builder**：SKILL_MODIFICATION_GUIDANCE 是本地新增，必须保留；MEMORY_GUIDANCE 已合入 upstream 的 declarative facts 指引（对 mem0 有益）
 5. **飞书适配器**：本地简化改动已被 upstream 的 hardened 版本覆盖，后续跟随 upstream

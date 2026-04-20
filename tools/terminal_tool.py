@@ -48,6 +48,14 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level threshold for auto-backgrounding.
+# If a spawned command doesn't finish within this many seconds, it is
+# automatically kept in background and the caller gets a session_id.
+# Overridable for testing via: patch("tools.terminal_tool.AUTO_BACKGROUND_TIMEOUT", 0)
+# ---------------------------------------------------------------------------
+AUTO_BACKGROUND_TIMEOUT = 5
+
 
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
@@ -1563,8 +1571,8 @@ def terminal_tool(
                 "after writing so it receives EOF."
             )
 
-        # Unified execution: try 5-second quick completion, auto-background if slow
-        AUTO_BACKGROUND_TIMEOUT = 5  # seconds to wait before auto-backgrounding
+        # Unified execution: spawn as background process, poll briefly,
+        # return immediately if fast, auto-background if slow.
         
         from tools.approval import get_current_session_key
         from tools.process_registry import process_registry
@@ -1572,51 +1580,116 @@ def terminal_tool(
         session_key = get_current_session_key(default="")
         effective_cwd = workdir or cwd
         
-        # Step 1: Try quick execution with 5-second timeout
-        quick_result = None
+        # Step 1: Spawn the command as a background process immediately.
+        # This is the "spawn first, release later" pattern — the process
+        # runs from the start; we never kill-and-restart it.
         try:
-            execute_kwargs = {"timeout": AUTO_BACKGROUND_TIMEOUT}
-            if workdir:
-                execute_kwargs["cwd"] = workdir
-            quick_result = env.execute(command, **execute_kwargs)
-            # Check if the command timed out (exit_code 124 means timeout)
-            if quick_result.get("returncode") == 124:
-                # Timeout - will proceed to background mode
-                quick_result = None
+            if env_type == "local":
+                proc_session = process_registry.spawn_local(
+                    command=command,
+                    cwd=effective_cwd,
+                    task_id=effective_task_id,
+                    session_key=session_key,
+                    env_vars=env.env if hasattr(env, 'env') else None,
+                    use_pty=effective_pty,
+                )
+            else:
+                proc_session = process_registry.spawn_via_env(
+                    env=env,
+                    command=command,
+                    cwd=effective_cwd,
+                    task_id=effective_task_id,
+                    session_key=session_key,
+                )
         except Exception as e:
-            error_str = str(e).lower()
-            # If it's a timeout-related exception, proceed to background mode
-            if "timeout" not in error_str:
-                # Other errors - retry up to 3 times
-                max_retries = 3
-                for retry_count in range(1, max_retries + 1):
-                    wait_time = 2 ** retry_count
-                    logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                   wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    time.sleep(wait_time)
-                    try:
-                        quick_result = env.execute(command, **execute_kwargs)
-                        # Check again for timeout exit code
-                        if quick_result.get("returncode") == 124:
-                            quick_result = None
-                            break  # Will proceed to background
-                        break
-                    except Exception as retry_e:
-                        if retry_count == max_retries:
-                            logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                         max_retries, _safe_command_preview(command), type(e).__name__, retry_e, effective_task_id, env_type,
-                                         exc_info=True)
-                            return json.dumps({
-                                "output": "",
-                                "exit_code": -1,
-                                "error": f"Command execution failed: {type(retry_e).__name__}: {str(retry_e)}"
-                            }, ensure_ascii=False)
-                        e = retry_e
+            logger.error("Failed to spawn background process: %s - Command: %s", e, _safe_command_preview(command))
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": f"Failed to start command: {type(e).__name__}: {str(e)}"
+            }, ensure_ascii=False)
+
+        # Populate routing metadata for notifications (needed for both
+        # fast-return and slow-background paths)
+        from gateway.session_context import get_session_env as _gse
+        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+        if _gw_platform:
+            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+            _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
+            _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
+            _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
+            proc_session.watcher_platform = _gw_platform
+            proc_session.watcher_chat_id = _gw_chat_id
+            proc_session.watcher_user_id = _gw_user_id
+            proc_session.watcher_user_name = _gw_user_name
+            proc_session.watcher_thread_id = _gw_thread_id
+
+        # Step 2: Wait for completion using Event (like Promise.race).
+        # If the process finishes within the threshold, collect results
+        # and return immediately. The exited_event is set by the reader
+        # thread when the process exits, so we get zero-delay detection.
+        deadline = time.monotonic() + AUTO_BACKGROUND_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # Wait for exited_event with timeout=0.5 so we can
+            # periodically check interrupt signals.
+            if proc_session._exited_event.wait(timeout=min(remaining, 0.5)):
+                break  # Process completed — exited_event was set
+
+            # Check interrupt
+            if is_interrupted():
+                process_registry.kill_process(proc_session.id)
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Command interrupted by user",
+                    "status": "interrupted",
+                }, ensure_ascii=False)
+
+            # Periodic activity touch so the gateway's inactivity timeout
+            # doesn't kill the agent during the poll loop.
+            try:
+                from tools.environments.base import touch_activity_if_due
+                touch_activity_if_due(
+                    {"last_touch": time.monotonic(), "start": time.monotonic()},
+                    "terminal poll waiting",
+                )
+            except Exception:
+                pass
+
+        # Step 2a: Command completed quickly — return results immediately
+        # and clean up the session from the registry.
+        completed = proc_session._exited_event.is_set()
         
-        # Step 2: If quick execution succeeded, return result immediately
-        if quick_result is not None:
-            output = quick_result.get("output", "")
-            returncode = quick_result.get("returncode", 0)
+        if completed:
+            # Wait for reader thread to finish draining output
+            if proc_session._reader_thread is not None:
+                proc_session._reader_thread.join(timeout=2)
+            
+            # Reap the child process if not already reaped by reader thread
+            if proc_session.process is not None:
+                try:
+                    proc_session.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            
+            # Collect output and exit code from the session
+            with proc_session._lock:
+                output = proc_session.output_buffer
+                returncode = proc_session.exit_code
+                if returncode is None and proc_session.process is not None:
+                    returncode = proc_session.process.returncode
+                if returncode is None:
+                    returncode = -1
+            
+            # Remove the session from the registry — it's fully consumed
+            process_registry._completion_consumed.add(proc_session.id)
+            with process_registry._lock:
+                process_registry._running.pop(proc_session.id, None)
+                process_registry._finished.pop(proc_session.id, None)
             
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
@@ -1656,99 +1729,61 @@ def terminal_tool(
 
             return json.dumps(result_dict, ensure_ascii=False)
         
-        # Step 3: Command is taking too long - auto-background it
+        # Step 3: Command is taking too long — keep it running in background.
+        # The process was already spawned in Step 1; we just return the
+        # background status and let the watcher infrastructure handle
+        # completion notification.
         logger.info("Command exceeded %ds threshold, auto-backgrounding: %s", AUTO_BACKGROUND_TIMEOUT, _safe_command_preview(command))
         
-        try:
-            if env_type == "local":
-                proc_session = process_registry.spawn_local(
-                    command=command,
-                    cwd=effective_cwd,
-                    task_id=effective_task_id,
-                    session_key=session_key,
-                    env_vars=env.env if hasattr(env, 'env') else None,
-                    use_pty=effective_pty,
-                )
-            else:
-                proc_session = process_registry.spawn_via_env(
-                    env=env,
-                    command=command,
-                    cwd=effective_cwd,
-                    task_id=effective_task_id,
-                    session_key=session_key,
-                )
-
-            # Populate routing metadata for notifications
-            from gateway.session_context import get_session_env as _gse
-            _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-            if _gw_platform:
-                _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                proc_session.watcher_platform = _gw_platform
-                proc_session.watcher_chat_id = _gw_chat_id
-                proc_session.watcher_user_id = _gw_user_id
-                proc_session.watcher_user_name = _gw_user_name
-                proc_session.watcher_thread_id = _gw_thread_id
-
-            # Always enable auto-notification for auto-backgrounded commands
-            proc_session.notify_on_complete = True
-            
-            # Register watcher for gateway notification
-            if proc_session.watcher_platform:
-                proc_session.watcher_interval = 5
-                process_registry.pending_watchers.append({
-                    "session_id": proc_session.id,
-                    "check_interval": 5,
-                    "session_key": session_key,
-                    "platform": proc_session.watcher_platform,
-                    "chat_id": proc_session.watcher_chat_id,
-                    "user_id": proc_session.watcher_user_id,
-                    "user_name": proc_session.watcher_user_name,
-                    "thread_id": proc_session.watcher_thread_id,
-                    "notify_on_complete": True,
-                })
-
-            # Set watch patterns if provided
-            if watch_patterns:
-                proc_session.watch_patterns = list(watch_patterns)
-
-            result_data = {
-                "output": (
-                    f"Command is taking longer than {AUTO_BACKGROUND_TIMEOUT} seconds. "
-                    f"It has been automatically moved to background execution.\n\n"
-                    f"Session ID: {proc_session.id}\n"
-                    f"PID: {proc_session.pid}\n\n"
-                    f"You can:\n"
-                    f"  - Check status: process(action='poll', session_id='{proc_session.id}')\n"
-                    f"  - View output: process(action='log', session_id='{proc_session.id}')\n"
-                    f"  - Kill process: process(action='kill', session_id='{proc_session.id}')\n\n"
-                    f"You will be automatically notified when the command completes."
-                ),
+        # Always enable auto-notification for auto-backgrounded commands
+        proc_session.notify_on_complete = True
+        
+        # Register watcher for gateway notification
+        if proc_session.watcher_platform:
+            proc_session.watcher_interval = 5
+            process_registry.pending_watchers.append({
                 "session_id": proc_session.id,
-                "pid": proc_session.pid,
-                "status": "auto_backgrounded",
-                "exit_code": None,
-                "error": None,
+                "check_interval": 5,
+                "session_key": session_key,
+                "platform": proc_session.watcher_platform,
+                "chat_id": proc_session.watcher_chat_id,
+                "user_id": proc_session.watcher_user_id,
+                "user_name": proc_session.watcher_user_name,
+                "thread_id": proc_session.watcher_thread_id,
                 "notify_on_complete": True,
-            }
-            if approval_note:
-                result_data["approval"] = approval_note
-            if pty_disabled_reason:
-                result_data["pty_note"] = pty_disabled_reason
-            if watch_patterns:
-                result_data["watch_patterns"] = proc_session.watch_patterns
+            })
 
-            return json.dumps(result_data, ensure_ascii=False)
-            
-        except Exception as e:
-            logger.error("Failed to auto-background command: %s - Command: %s", e, _safe_command_preview(command))
-            return json.dumps({
-                "output": "",
-                "exit_code": -1,
-                "error": f"Command timed out and failed to move to background: {str(e)}"
-            }, ensure_ascii=False)
+        # Set watch patterns if provided
+        if watch_patterns:
+            proc_session.watch_patterns = list(watch_patterns)
+
+        result_data = {
+            "output": (
+                f"Command is taking longer than {AUTO_BACKGROUND_TIMEOUT} seconds. "
+                f"It has been automatically moved to background execution.\n\n"
+                f"Session ID: {proc_session.id}\n"
+                f"PID: {proc_session.pid}\n\n"
+                f"You can:\n"
+                f"  - Check status: process(action='poll', session_id='{proc_session.id}')\n"
+                f"  - View output: process(action='log', session_id='{proc_session.id}')\n"
+                f"  - Kill process: process(action='kill', session_id='{proc_session.id}')\n\n"
+                f"You will be automatically notified when the command completes."
+            ),
+            "session_id": proc_session.id,
+            "pid": proc_session.pid,
+            "status": "auto_backgrounded",
+            "exit_code": None,
+            "error": None,
+            "notify_on_complete": True,
+        }
+        if approval_note:
+            result_data["approval"] = approval_note
+        if pty_disabled_reason:
+            result_data["pty_note"] = pty_disabled_reason
+        if watch_patterns:
+            result_data["watch_patterns"] = proc_session.watch_patterns
+
+        return json.dumps(result_data, ensure_ascii=False)
 
     except Exception as e:
         import traceback

@@ -111,6 +111,7 @@ class ProcessSession:
     _watch_window_start: float = field(default=0.0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _exited_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -526,6 +527,7 @@ class ProcessRegistry:
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
             session.exit_code = session.process.returncode
+            session._exited_event.set()
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -571,6 +573,7 @@ class ProcessRegistry:
                     except (ValueError, IndexError):
                         session.exit_code = -1
                     session.exited = True
+                    session._exited_event.set()
                     self._move_to_finished(session)
                     return
 
@@ -578,6 +581,7 @@ class ProcessRegistry:
                 # Environment might be gone (sandbox reaped, etc.)
                 session.exited = True
                 session.exit_code = -1
+                session._exited_event.set()
                 self._move_to_finished(session)
                 return
 
