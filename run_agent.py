@@ -9703,6 +9703,7 @@ class AIAgent:
                                     messages.append(continue_msg)
                                     self._session_messages = messages
                                     self._save_session_log(messages)
+                                    self._flush_messages_to_session_db(messages)
                                     restart_with_length_continuation = True
                                     break
 
@@ -10960,6 +10961,7 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}↻ Codex response incomplete; continuing turn ({self._codex_incomplete_retries}/3)")
                         self._session_messages = messages
                         self._save_session_log(messages)
+                        self._flush_messages_to_session_db(messages)
                         continue
 
                     self._codex_incomplete_retries = 0
@@ -11272,6 +11274,7 @@ class AIAgent:
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages
                     self._save_session_log(messages)
+                    self._flush_messages_to_session_db(messages)
                     
                     # Continue loop for next response
                     continue
@@ -11421,6 +11424,7 @@ class AIAgent:
                             messages.append(interim_msg)
                             self._session_messages = messages
                             self._save_session_log(messages)
+                            self._flush_messages_to_session_db(messages)
                             continue
 
                         # ── Empty response retry ──────────────────────
@@ -11548,6 +11552,7 @@ class AIAgent:
                         messages.append(continue_msg)
                         self._session_messages = messages
                         self._save_session_log(messages)
+                        self._flush_messages_to_session_db(messages)
                         continue
 
                     codex_ack_continuations = 0

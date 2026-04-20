@@ -266,7 +266,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     top_k=5,
                 ))
                 if results:
-                    lines = [r.get("memory", "") for r in results if r.get("memory")]
+                    lines = [r.get("memory", "") for r in results if r.get("memory") and r.get("score", 0) > 0.3]
                     with self._prefetch_lock:
                         self._prefetch_result = "\n".join(f"- {l}" for l in lines)
                 self._record_success()
@@ -344,7 +344,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
+                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results if r.get("score", 0) > 0.3]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()

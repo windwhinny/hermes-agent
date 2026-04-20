@@ -1594,6 +1594,18 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+            # Flush any un-persisted messages from the agent's in-memory
+            # conversation to disk before closing resources.  Without this,
+            # messages accumulated during the agent's tool-calling loop
+            # (between _persist_session calls) are lost on gateway restart.
+            # conversation_history=None is safe here because
+            # _flush_messages_to_session_db uses _last_flushed_db_idx to
+            # skip already-written messages — it won't duplicate writes.
+            try:
+                if hasattr(agent, "_persist_session") and hasattr(agent, "_session_messages"):
+                    agent._persist_session(agent._session_messages, None)
+            except Exception as e:
+                logger.debug("Failed to flush agent session on shutdown: %s", e)
             self._cleanup_agent_resources(agent)
 
     def _cleanup_agent_resources(self, agent: Any) -> None:
