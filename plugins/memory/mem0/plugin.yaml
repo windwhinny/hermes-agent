@@ -1,5 +1,5 @@
 name: mem0
 version: 1.0.0
-description: "Mem0 — server-side LLM fact extraction with semantic search, reranking, and automatic deduplication."
+description: "Mem0 本地自建 — DashScope qwen-max + Qdrant 嵌入式向量库，全链路国内 API，中文提取。"
 pip_dependencies:
   - mem0ai

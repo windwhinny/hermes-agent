@@ -1,17 +1,9 @@
-"""Mem0 memory plugin — MemoryProvider interface.
+"""Mem0 本地自建插件 — MemoryProvider interface.
 
-Server-side LLM fact extraction, semantic search with reranking, and
-automatic deduplication via the Mem0 Platform API.
+基于 Mem0 v2 开源 SDK + Qdrant 服务端向量库 + DashScope (qwen-max) 的本地记忆系统。
+替代原版云端 API，全链路国内 API，提取语言为中文。
 
-Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC.
-
-Config via environment variables:
-  MEM0_API_KEY       — Mem0 Platform API key (required)
-  MEM0_HOST          — Mem0 API host for self-hosted instances (optional)
-  MEM0_USER_ID       — User identifier (default: hermes-user)
-  MEM0_AGENT_ID      — Agent identifier (default: hermes)
-
-Or via $HERMES_HOME/mem0.json.
+配置通过 ~/.hermes/mem0/config.py 管理（LLM、Embedding、向量库等）。
 """
 
 from __future__ import annotations
@@ -19,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Dict, List
@@ -28,44 +21,36 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-# Circuit breaker: after this many consecutive failures, pause API calls
-# for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
-_BREAKER_THRESHOLD = 5
-_BREAKER_COOLDOWN_SECS = 120
-
-
 # ---------------------------------------------------------------------------
-# Config
+# 本地 Mem0 实例初始化
 # ---------------------------------------------------------------------------
 
-def _load_config() -> dict:
-    """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
+_mem0_instance = None
+_mem0_lock = threading.Lock()
+_mem0_initialized = False
 
-    Environment variables provide defaults; mem0.json (if present) overrides
-    individual keys.  This avoids a silent failure when the JSON file exists
-    but is missing fields like ``api_key`` that the user set in ``.env``.
-    """
-    from hermes_constants import get_hermes_home
 
-    config = {
-        "api_key": os.environ.get("MEM0_API_KEY", ""),
-        "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
-        "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
-        "host": os.environ.get("MEM0_HOST", ""),
-        "rerank": True,
-        "keyword_search": False,
-    }
-
-    config_path = get_hermes_home() / "mem0.json"
-    if config_path.exists():
+def _get_local_mem0():
+    """获取本地 Mem0 Memory 实例（线程安全、懒加载）。"""
+    global _mem0_instance, _mem0_initialized
+    with _mem0_lock:
+        if _mem0_instance is not None:
+            return _mem0_instance
         try:
-            file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({k: v for k, v in file_cfg.items()
-                           if v is not None and v != ""})
-        except Exception:
-            pass
+            # 加载自定义配置
+            config_path = os.path.expanduser("~/.hermes/mem0")
+            if config_path not in sys.path:
+                sys.path.insert(0, config_path)
+            from config import MEM0_CONFIG
 
-    return config
+            from mem0 import Memory
+            _mem0_instance = Memory.from_config(MEM0_CONFIG)
+            _mem0_initialized = True
+            logger.info("Mem0 local instance initialized successfully")
+            return _mem0_instance
+        except Exception as e:
+            logger.error("Failed to initialize Mem0 local instance: %s", e)
+            raise RuntimeError(f"Mem0 本地初始化失败: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +70,12 @@ SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
         "Search memories by meaning. Returns relevant facts ranked by similarity. "
-        "Set rerank=true for higher accuracy on important queries."
+        "Use for recalling specific details about the user."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false)."},
             "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
         },
         "required": ["query"],
@@ -118,79 +102,64 @@ CONCLUDE_SCHEMA = {
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
-class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+class Mem0LocalMemoryProvider(MemoryProvider):
+    """Mem0 本地自建记忆系统（开源 SDK + Qdrant 服务端 + DashScope qwen-max）。"""
 
     def __init__(self):
-        self._config = None
-        self._client = None
-        self._client_lock = threading.Lock()
-        self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
-        self._rerank = True
+        self._client = None
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._sync_thread = None
-        # Circuit breaker state
+        # Circuit breaker
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        _BREAKER_THRESHOLD = 5
+        _BREAKER_COOLDOWN = 120
 
     @property
     def name(self) -> str:
-        return "mem0"
+        return "mem0-local"
 
     def is_available(self) -> bool:
-        cfg = _load_config()
-        return bool(cfg.get("api_key"))
+        """检查本地配置是否就绪。"""
+        config_path = os.path.expanduser("~/.hermes/mem0/config.py")
+        if not os.path.exists(config_path):
+            return False
+        # 检查 DashScope API Key
+        try:
+            config_dir = os.path.expanduser("~/.hermes/mem0")
+            if config_dir not in sys.path:
+                sys.path.insert(0, config_dir)
+            from config import DASHSCOPE_API_KEY
+            return bool(DASHSCOPE_API_KEY)
+        except Exception:
+            return False
 
-    def save_config(self, values, hermes_home):
-        """Write config to $HERMES_HOME/mem0.json."""
-        import json
-        from pathlib import Path
-        config_path = Path(hermes_home) / "mem0.json"
-        existing = {}
-        if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text())
-            except Exception:
-                pass
-        existing.update(values)
-        config_path.write_text(json.dumps(existing, indent=2))
+    def initialize(self, session_id: str, **kwargs) -> None:
+        self._user_id = kwargs.get("user_id") or "hermes-user"
+        self._agent_id = kwargs.get("agent_id") or "hermes"
+        try:
+            self._client = _get_local_mem0()
+            logger.info("Mem0 local provider initialized for user=%s", self._user_id)
+        except Exception as e:
+            logger.warning("Mem0 local init failed, will retry on first use: %s", e)
 
-    def get_config_schema(self):
-        return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
-            {"key": "host", "description": "Mem0 API host (for self-hosted instances)", "default": "", "env_var": "MEM0_HOST"},
-            {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
-            {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
-        ]
+    def _get_client_safe(self):
+        """安全获取客户端，失败时重新初始化。"""
+        if self._client is not None:
+            return self._client
+        self._client = _get_local_mem0()
+        return self._client
 
-    def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
-        with self._client_lock:
-            if self._client is not None:
-                return self._client
-            try:
-                from mem0 import MemoryClient
-                # Support custom host for self-hosted Mem0
-                host = self._config.get("host", "") if self._config else ""
-                if host:
-                    self._client = MemoryClient(api_key=self._api_key, host=host)
-                else:
-                    self._client = MemoryClient(api_key=self._api_key)
-                return self._client
-            except ImportError:
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+    # -- Circuit breaker -----------------------------------------------------
 
     def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
-        if self._consecutive_failures < _BREAKER_THRESHOLD:
+        if self._consecutive_failures < 5:
             return False
         if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
             self._consecutive_failures = 0
             return False
         return True
@@ -200,47 +169,30 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def _record_failure(self):
         self._consecutive_failures += 1
-        if self._consecutive_failures >= _BREAKER_THRESHOLD:
-            self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
-            logger.warning(
-                "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
-                self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
-            )
+        if self._consecutive_failures >= 5:
+            self._breaker_open_until = time.monotonic() + 120
+            logger.warning("Mem0 local circuit breaker tripped after %d failures", self._consecutive_failures)
 
-    def initialize(self, session_id: str, **kwargs) -> None:
-        self._config = _load_config()
-        self._api_key = self._config.get("api_key", "")
-        # Prefer gateway-provided user_id for per-user memory scoping;
-        # fall back to config/env default for CLI (single-user) sessions.
-        self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
-        self._agent_id = self._config.get("agent_id", "hermes")
-        self._rerank = self._config.get("rerank", True)
+    # -- Filters -------------------------------------------------------------
 
     def _read_filters(self) -> Dict[str, Any]:
-        """Filters for search/get_all — scoped to user only for cross-session recall."""
         return {"user_id": self._user_id}
 
-    def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
-        return {"user_id": self._user_id, "agent_id": self._agent_id}
+    def _write_user_id(self) -> str:
+        return self._user_id
 
-    @staticmethod
-    def _unwrap_results(response: Any) -> list:
-        """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
-        if isinstance(response, dict):
-            return response.get("results", [])
-        if isinstance(response, list):
-            return response
-        return []
+    # -- System prompt -------------------------------------------------------
 
     def system_prompt_block(self) -> str:
         return (
-            "# Mem0 Memory\n"
-            f"Active. User: {self._user_id}.\n"
+            "# Mem0 Memory (本地自建)\n"
+            f"Active. User: {self._user_id}. 使用 DashScope qwen-max + Qdrant 服务端向量库.\n"
             "Use mem0_search to find memories, mem0_conclude to store facts, "
-            "mem0_profile for a full overview."
+            "mem0_profile for a full overview.\n"
+            "所有记忆均以中文存储和提取。"
         )
+
+    # -- Prefetch ------------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -258,13 +210,9 @@ class Mem0MemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                client = self._get_client()
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=self._rerank,
-                    top_k=5,
-                ))
+                client = self._get_client_safe()
+                raw = client.search(query=query, filters=self._read_filters(), top_k=5)
+                results = self._unwrap_results(raw)
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory") and r.get("score", 0) > 0.3]
                     with self._prefetch_lock:
@@ -272,35 +220,48 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
             except Exception as e:
                 self._record_failure()
-                logger.debug("Mem0 prefetch failed: %s", e)
+                logger.debug("Mem0 local prefetch failed: %s", e)
 
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
+        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-local-prefetch")
         self._prefetch_thread.start()
 
+    # -- Sync turn -----------------------------------------------------------
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """发送对话轮次到本地 Mem0 进行记忆提取（非阻塞）。"""
         if self._is_breaker_open():
             return
 
         def _sync():
             try:
-                client = self._get_client()
+                client = self._get_client_safe()
                 messages = [
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters(), output_format="v1.1")
+                client.add(messages, user_id=self._write_user_id())
                 self._record_success()
+                logger.debug("Mem0 local sync success for user=%s", self._user_id)
             except Exception as e:
                 self._record_failure()
-                logger.warning("Mem0 sync failed: %s", e)
+                logger.warning("Mem0 local sync failed: %s", e)
 
-        # Wait for any previous sync before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
-        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
+        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-local-sync")
         self._sync_thread.start()
+
+    # -- Tool schemas & dispatch ---------------------------------------------
+
+    @staticmethod
+    def _unwrap_results(response: Any) -> list:
+        """Normalize Mem0 v2 API response — wraps results in {"results": [...]}."""
+        if isinstance(response, dict):
+            return response.get("results", [])
+        if isinstance(response, list):
+            return response
+        return []
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
@@ -308,75 +269,76 @@ class Mem0MemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
             return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
+                "error": "Mem0 本地服务暂时不可用（连续多次失败），将自动恢复。"
             })
 
         try:
-            client = self._get_client()
+            client = self._get_client_safe()
         except Exception as e:
             return tool_error(str(e))
 
         if tool_name == "mem0_profile":
             try:
-                memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
+                raw = client.get_all(filters=self._read_filters())
+                memories = self._unwrap_results(raw)
                 self._record_success()
                 if not memories:
-                    return json.dumps({"result": "No memories stored yet."})
+                    return json.dumps({"result": "暂无存储的记忆。"})
                 lines = [m.get("memory", "") for m in memories if m.get("memory")]
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return tool_error(f"获取记忆失败: {e}")
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
-                return tool_error("Missing required parameter: query")
-            rerank = args.get("rerank", False)
+                return tool_error("缺少必要参数: query")
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=rerank,
-                    top_k=top_k,
-                ))
+                raw = client.search(query=query, filters=self._read_filters(), top_k=top_k)
+                results = self._unwrap_results(raw)
                 self._record_success()
                 if not results:
-                    return json.dumps({"result": "No relevant memories found."})
+                    return json.dumps({"result": "未找到相关记忆。"})
                 items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results if r.get("score", 0) > 0.3]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return tool_error(f"搜索失败: {e}")
 
         elif tool_name == "mem0_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
-                return tool_error("Missing required parameter: conclusion")
+                return tool_error("缺少必要参数: conclusion")
             try:
-                client.add(
-                    [{"role": "user", "content": conclusion}],
-                    **self._write_filters(),
-                    infer=False,
-                    output_format="v1.1",
-                )
+                # 直接存储，不经过 LLM 提取
+                client.add(conclusion, user_id=self._write_user_id(), infer=False)
                 self._record_success()
-                return json.dumps({"result": "Fact stored."})
+                return json.dumps({"result": "记忆已存储。"})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to store: {e}")
+                return tool_error(f"存储失败: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
+
+    # -- Shutdown ------------------------------------------------------------
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        with self._client_lock:
-            self._client = None
+        # 本地 Mem0 实例不需要显式关闭（Qdrant 服务端独立运行，不需要进程内持久化）
+
+    # -- Config schema (for setup wizard) ------------------------------------
+
+    def get_config_schema(self):
+        return []  # 本地版不需要额外配置，全在 config.py 里
+
+    def save_config(self, values, hermes_home):
+        pass  # 本地版不需要
 
 
 def register(ctx) -> None:
-    """Register Mem0 as a memory provider plugin."""
-    ctx.register_memory_provider(Mem0MemoryProvider())
+    """Register Mem0 local as a memory provider plugin."""
+    ctx.register_memory_provider(Mem0LocalMemoryProvider())

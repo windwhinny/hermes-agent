@@ -1042,15 +1042,20 @@ def run_doctor(args):
             check_warn("Honcho check failed", str(_e))
     elif _active_memory_provider == "mem0":
         try:
-            from plugins.memory.mem0 import _load_config as _load_mem0_config
-            mem0_cfg = _load_mem0_config()
-            mem0_key = mem0_cfg.get("api_key", "")
-            if mem0_key:
-                check_ok("Mem0 API key configured")
-                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+            # 检查本地 Mem0 配置是否就绪
+            config_path = os.path.expanduser("~/.hermes/mem0/config.py")
+            if not os.path.exists(config_path):
+                check_fail("Mem0 local config not found", "(create ~/.hermes/mem0/config.py or run hermes memory setup)")
+                issues.append("Mem0 is set as memory provider but local config is missing")
             else:
-                check_fail("Mem0 API key not set", "(set MEM0_API_KEY in .env or run hermes memory setup)")
-                issues.append("Mem0 is set as memory provider but API key is missing")
+                sys.path.insert(0, os.path.expanduser("~/.hermes/mem0"))
+                from config import DASHSCOPE_API_KEY, MEM0_CONFIG
+                if DASHSCOPE_API_KEY:
+                    check_ok("Mem0 local config ready (DashScope qwen-max + Qdrant)")
+                    check_info(f"LLM: {MEM0_CONFIG['llm']['config']['model']}  Embedding: {MEM0_CONFIG['embedder']['config']['model']}")
+                else:
+                    check_fail("DashScope API key not set", "(set DASHSCOPE_API_KEY in ~/.hermes/.env)")
+                    issues.append("Mem0 is set as memory provider but DashScope API key is missing")
         except ImportError:
             check_fail("Mem0 plugin not loadable", "pip install mem0ai")
             issues.append("Mem0 is set as memory provider but mem0ai is not installed")
