@@ -139,7 +139,8 @@ class Mem0LocalMemoryProvider(MemoryProvider):
             return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._user_id = kwargs.get("user_id") or "hermes-user"
+        # 固定 user_id，不管从哪个渠道接入（飞书/微信/Telegram），都共享同一份 Mem0 记忆
+        self._user_id = "ou_ff3a0b6dfd383eefe28e55370ea8257e"
         self._agent_id = kwargs.get("agent_id") or "hermes"
         try:
             self._client = _get_local_mem0()

@@ -193,6 +193,36 @@ upstream 在 feishu.py 上做了重要改进，已合入并覆盖了我们的简
 
 ## 九、其他小改动
 
+---
+
+## 十、Mem0 user_id 固定化（多渠道记忆共享）
+
+### 改动动机
+
+Gateway 模式下，不同渠道（飞书、Telegram、微信、CLI）接入时会传入不同的 `user_id`（如飞书 `ou_ff3a0b6dfd383eefe28e55370ea8257e`、Telegram `8681423138`、微信 `o9cq...`）。Mem0 按 `user_id` 隔离记忆，导致同一用户的不同渠道之间记忆无法共享——在飞书说过的话，从 Telegram 回来就搜不到了。
+
+### 实施方案
+
+在 `Mem0LocalMemoryProvider.initialize()` 中**忽略 gateway 传入的 `user_id`**，固定使用飞书用户 ID：
+
+```python
+self._user_id = "ou_ff3a0b6dfd383eefe28e55370ea8257e"
+```
+
+这样所有渠道（飞书、Telegram、微信、CLI）读写 Mem0 时都用同一个 user_id，共享同一份记忆池。
+
+### 涉及文件及冲突解决指引
+
+| 文件 | 改动 | 冲突解决策略 |
+|------|------|-------------|
+| `plugins/memory/mem0/__init__.py` | `initialize()` 中 `self._user_id = kwargs.get("user_id")` → 固定为飞书 ID | **低风险**。如果 upstream 修改了 initialize 的 user_id 逻辑，保留本地固定值即可 |
+
+**注意**：Qdrant 向量库中可能已存在以旧 user_id（Telegram/微信/CLI）写入的记忆数据，这些数据用新 user_id 搜不到。如需迁移，需在 Qdrant 中手动更新 `user_id` filter 字段。
+
+---
+
+## 十一、其他小改动
+
 | 文件 | 改动 | 说明 |
 |------|------|------|
 | `agent/title_generator.py` | 删除 1 行 import | 无关紧要，随 upstream 走即可 |
@@ -245,5 +275,5 @@ git merge merge/upstream-YYYYMMDD
 
 ---
 
-*最后更新：2026-04-20（upstream main 合并后 + skills_guard INSTALL_POLICY 调整）*
+*最后更新：2026-04-21（Mem0 user_id 固定化，多渠道共享同一份记忆）*
 *维护者：时允 (windwhinny) + 奇点 (Singularity AI Agent)*
