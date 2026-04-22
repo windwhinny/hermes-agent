@@ -275,5 +275,5 @@ git merge merge/upstream-YYYYMMDD
 
 ---
 
-*最后更新：2026-04-21（Mem0 user_id 固定化，多渠道共享同一份记忆）*
+*最后更新：2026-04-22（合并 upstream/main 308 commits，保留 volcengine TTS + 新增 kittentts TTS，恢复 vision temperature 参数，移除 .github/workflows/nix.yml）*
 *维护者：时允 (windwhinny) + 奇点 (Singularity AI Agent)*
