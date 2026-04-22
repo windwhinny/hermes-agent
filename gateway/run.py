@@ -1653,10 +1653,26 @@ class GatewayRunner:
         Called at the very start of stop() — adapters are still connected so
         messages can be delivered.  Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
+
+        When ``_restart_requested`` is True, also marks each active session as
+        ``resume_pending`` so the next startup can auto-resume them.  This
+        must happen here (before drain) because the agent may finish and leave
+        ``_running_agents`` before the drain even starts (e.g. when the agent
+        itself triggered the restart via the CLI fast-path).
         """
         active = self._snapshot_running_agents()
         if not active:
             return
+
+        if self._restart_requested and getattr(self, "session_store", None):
+            for session_key, agent in active.items():
+                if agent is _AGENT_PENDING_SENTINEL:
+                    continue
+                try:
+                    self.session_store.mark_resume_pending(session_key, "restart")
+                except Exception as e:
+                    logger.debug("mark_resume_pending failed for %s: %s", session_key[:20], e)
+            self._write_restart_active_sessions(active)
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
@@ -1906,6 +1922,10 @@ class GatewayRunner:
         self._restart_via_service = via_service
         self._restart_task_started = True
 
+        active = self._snapshot_running_agents()
+        if active:
+            self._write_restart_active_sessions(active)
+
         async def _run_restart() -> None:
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
@@ -2053,6 +2073,15 @@ class GatewayRunner:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
             logger.debug("Stuck-loop detection failed: %s", e)
+
+        loop = asyncio.get_running_loop()
+        _model_tools_warmup: Optional[asyncio.Future] = None
+        try:
+            _model_tools_warmup = loop.run_in_executor(
+                None, lambda: __import__("model_tools")
+            )
+        except Exception:
+            pass
 
         connected_count = 0
         enabled_platform_count = 0
@@ -2229,6 +2258,9 @@ class GatewayRunner:
 
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
+
+        # Proactively resume sessions interrupted by the previous shutdown.
+        await self._auto_resume_pending_sessions()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -2564,7 +2596,16 @@ class GatewayRunner:
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
 
-            timeout = self._restart_drain_timeout
+            if not self._restart_requested and self._running_agents:
+                self._interrupt_running_agents(
+                    _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                )
+
+            timeout = (
+                self._restart_drain_timeout
+                if self._restart_requested
+                else min(self._restart_drain_timeout, 10.0)
+            )
             active_agents, timed_out = await self._drain_active_agents(timeout)
             if timed_out:
                 logger.warning(
@@ -8091,6 +8132,118 @@ class GatewayRunner:
             logger.warning("Restart notification failed: %s", e)
         finally:
             notify_path.unlink(missing_ok=True)
+
+    def _write_restart_active_sessions(self, active: Dict[str, Any]) -> None:
+        """Persist the list of active sessions to a file before restart.
+
+        ``_auto_resume_pending_sessions`` reads this file on the next startup
+        to proactively trigger those sessions.  Using a separate file avoids
+        the race where the agent completes its turn during drain and
+        ``clear_resume_pending`` wipes the flag before the new gateway reads it.
+        """
+        if not getattr(self, "session_store", None):
+            return
+        restart_path = Path(self.session_store.sessions_dir) / ".restart_active_sessions.json"
+        records = []
+        for session_key, agent in active.items():
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            try:
+                self.session_store._ensure_loaded()
+                entry = self.session_store._entries.get(session_key)
+                origin = entry.origin if entry else None
+                if origin is None:
+                    parsed = _parse_session_key(session_key)
+                    if not parsed:
+                        continue
+                    origin = SessionSource(
+                        platform=Platform(parsed["platform"]),
+                        chat_id=parsed["chat_id"],
+                        chat_type=parsed.get("chat_type", "dm"),
+                        thread_id=parsed.get("thread_id"),
+                    )
+                records.append({
+                    "session_key": session_key,
+                    "session_id": entry.session_id if entry else None,
+                    "origin": origin.to_dict() if hasattr(origin, "to_dict") else {
+                        "platform": origin.platform.value if hasattr(origin.platform, "value") else str(origin.platform),
+                        "chat_id": origin.chat_id,
+                        "chat_type": getattr(origin, "chat_type", "dm"),
+                        "thread_id": getattr(origin, "thread_id", None),
+                    },
+                })
+            except Exception as e:
+                logger.debug("_write_restart_active_sessions: skip %s: %s", session_key[:20], e)
+        if records:
+            try:
+                restart_path.write_text(json.dumps(records, ensure_ascii=False))
+                logger.info("Wrote %d active session(s) to restart file", len(records))
+            except Exception as e:
+                logger.warning("Failed to write restart active sessions: %s", e)
+
+    async def _auto_resume_pending_sessions(self) -> None:
+        """Proactively resume sessions that were active before the last restart.
+
+        Reads the ``.restart_active_sessions.json`` file written by
+        ``_write_restart_active_sessions`` during the previous shutdown, then
+        injects a synthetic internal ``MessageEvent`` for each session so the
+        agent picks up where it left off without waiting for a user message.
+        """
+        if not getattr(self, "session_store", None):
+            return
+        restart_path = Path(self.session_store.sessions_dir) / ".restart_active_sessions.json"
+        if not restart_path.exists():
+            return
+
+        try:
+            records = json.loads(restart_path.read_text())
+        except Exception as e:
+            logger.debug("auto_resume: failed to read restart file: %s", e)
+            restart_path.unlink(missing_ok=True)
+            return
+        finally:
+            restart_path.unlink(missing_ok=True)
+
+        if not records:
+            return
+
+        logger.info("Auto-resuming %d session(s) from restart file", len(records))
+
+        for rec in records:
+            try:
+                origin = rec.get("origin", {})
+                platform_str = origin.get("platform")
+                chat_id = origin.get("chat_id")
+                if not platform_str or not chat_id:
+                    continue
+
+                platform = Platform(platform_str)
+                adapter = self.adapters.get(platform)
+                if not adapter:
+                    logger.debug(
+                        "auto_resume: skipping %s — %s adapter not connected",
+                        rec.get("session_key", "?")[:30], platform_str,
+                    )
+                    continue
+
+                source = SessionSource(
+                    platform=platform,
+                    chat_id=chat_id,
+                    chat_type=origin.get("chat_type", "dm"),
+                    thread_id=origin.get("thread_id"),
+                )
+                event = MessageEvent(
+                    text="[auto-resume after gateway restart]",
+                    source=source,
+                    internal=True,
+                )
+                asyncio.create_task(adapter.handle_message(event))
+                logger.info(
+                    "Auto-resume dispatched for %s on %s:%s",
+                    rec.get("session_key", "?")[:30], platform_str, chat_id,
+                )
+            except Exception as e:
+                logger.warning("auto_resume failed for %s: %s", rec.get("session_key", "?")[:30], e)
 
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.

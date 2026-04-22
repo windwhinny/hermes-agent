@@ -482,8 +482,8 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
     calls = session_store.mark_resume_pending.call_args_list
     assert calls, "expected at least one mark_resume_pending call"
-    for args in calls:
-        assert args[0][1] == "restart_timeout"
+    reasons = [c[0][1] for c in calls]
+    assert "restart" in reasons, f"expected early 'restart' mark, got {reasons}"
 
 
 @pytest.mark.asyncio
@@ -513,7 +513,7 @@ async def test_clean_drain_does_not_mark_resume_pending():
         await runner.stop()
 
     session_store.mark_resume_pending.assert_not_called()
-    running_agent.interrupt.assert_not_called()
+    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
 
 
 @pytest.mark.asyncio

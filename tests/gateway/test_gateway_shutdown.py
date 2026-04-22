@@ -63,7 +63,8 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
 
-    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
+    assert running_agent.interrupt.call_count == 2
+    running_agent.interrupt.assert_any_call("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
     assert runner.adapters == {}
     assert runner._running_agents == {}
@@ -90,7 +91,7 @@ async def test_gateway_stop_drains_running_agents_before_disconnect():
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
 
-    running_agent.interrupt.assert_not_called()
+    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
     assert runner._shutdown_event.is_set() is True
 
@@ -109,7 +110,8 @@ async def test_gateway_stop_interrupts_after_drain_timeout():
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
 
-    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
+    assert running_agent.interrupt.call_count == 2
+    running_agent.interrupt.assert_any_call("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
     assert runner._shutdown_event.is_set() is True
 

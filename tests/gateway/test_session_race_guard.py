@@ -472,5 +472,6 @@ async def test_shutdown_skips_sentinel():
         await runner.stop()
 
     # Real agent should have been interrupted
-    real_agent.interrupt.assert_called_once()
+    real_agent.interrupt.assert_called()
+    assert real_agent.interrupt.call_count == 2
     # Should not have raised on the sentinel

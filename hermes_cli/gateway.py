@@ -3660,10 +3660,21 @@ def gateway_command(args):
                 print(f"✓ Stopped {get_service_name()} service")
     
     elif subcmd == "restart":
-        # Try service first, fall back to killing and restarting
-        service_available = False
         system = getattr(args, 'system', False)
         restart_all = getattr(args, 'all', False)
+
+        if not restart_all:
+            from gateway.status import get_running_pid as _get_gw_pid
+            _gw_pid = _get_gw_pid()
+            if _gw_pid is not None and _is_pid_ancestor_of_current_process(_gw_pid):
+                if _request_gateway_self_restart(_gw_pid):
+                    print("♻ Restart signal sent to gateway — returning immediately (child process).")
+                    return
+                else:
+                    print("⚠ Failed to send restart signal to gateway ancestor.")
+
+        # Try service first, fall back to killing and restarting
+        service_available = False
         service_configured = False
 
         if restart_all:

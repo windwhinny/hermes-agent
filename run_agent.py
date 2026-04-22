@@ -8782,6 +8782,8 @@ class AIAgent:
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
+
+        self._session_messages = messages
         
         if not self.quiet_mode:
             _print_preview = _summarize_user_message_for_log(user_message)
@@ -8880,6 +8882,7 @@ class AIAgent:
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
                     )
+                    self._session_messages = messages
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
                     # Compression created a new session — clear the history
@@ -10376,6 +10379,7 @@ class AIAgent:
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
                             )
+                            self._session_messages = messages
                             # Compression created a new session — clear history
                             # so _flush_messages_to_session_db writes compressed
                             # messages to the new session, not skipping them.
@@ -10473,6 +10477,7 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        self._session_messages = messages
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
@@ -10609,6 +10614,7 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        self._session_messages = messages
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
