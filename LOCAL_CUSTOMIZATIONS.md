@@ -340,5 +340,5 @@ git merge merge/upstream-YYYYMMDD
 
 ---
 
-*最后更新：2026-04-22（新增 Gateway 重启与自动恢复机制、`_session_messages` 引用即时绑定、飞书 99992354 降级码、tavily MCP 全局安装）*
+*最后更新：2026-04-22 commit ab4c95b8（新增 Gateway 重启与自动恢复机制、`_session_messages` 引用即时绑定、飞书 99992354 降级码、tavily MCP 全局安装）*
 *维护者：时允 (windwhinny) + 奇点 (Singularity AI Agent)*
